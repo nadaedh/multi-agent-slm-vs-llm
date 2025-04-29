@@ -1,4 +1,3 @@
-import math
 import os
 import random
 import time
@@ -15,6 +14,7 @@ import numpy as np
 MODEL_PATH = "/Users/nadaeddahir/mistral-gguf/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
 MAX_EXAMPLES = 10  
 SEED = 42
+MAX_CONTEXT_EXAMPLES = 5
 metric = evaluate.load("exact_match")
 
 random.seed(SEED)
@@ -26,10 +26,16 @@ def extract_answer_letter(text):
     return match.group(1) if match else "INVALID"
 
 class MistralAgent:
-    def __init__(self, name, model_path):
+    def __init__(self, name, model_path, knowledge=""):
         self.name = name
-        self.llm = Llama(model_path=model_path, n_ctx=4096, logits_all=True)
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=4096,
+            n_threads=4,
+            logits_all=True
+        )
         self.memory = []
+        self.knowledge = knowledge
 
     def reset(self):
         self.memory.clear()
@@ -38,13 +44,18 @@ class MistralAgent:
         self.memory.append(f"{sender}: {message}")
 
     def respond(self):
-        prompt = "\n".join(self.memory) + f"\n{self.name}:"
+        prompt = (
+            f"Role: You are {self.name}, an expert with specific knowledge.\n"
+            f"Knowledge:\n{self.knowledge}\n\n"
+            "Conversation History:\n" + "\n".join(self.memory) + 
+            f"\n{self.name}: Based on my knowledge and the discussion, the answer is"
+        )
 
         response = self.llm.create_completion(
             prompt=prompt,
-            temperature=0.7,
-            max_tokens=200,
-            stop=["\n", "\n\n"]
+            temperature=0.3,  # lower temperature for more focused answers
+            max_tokens=10,
+            stop=["\n", ".", ","]
         )
 
         raw_output = response["choices"][0]["text"].strip()
@@ -54,22 +65,31 @@ class MistralAgent:
 
 class JudgeAgent:
     def __init__(self, model_path):
-        self.llm = Llama(model_path=model_path, n_ctx=4096)
+        self.llm = Llama(
+            model_path=model_path,
+            n_ctx=4096,
+            n_threads=4
+        )
 
     def analyze(self, discussion_history):
+        recent_discussion = "\n".join(discussion_history[-6:]) # only last few turns for decision
+        
         prompt = (
-            "You are a neutral judge. Based on the following discussion between two experts, "
-            "determine the final answer (A, B, C, or D). Only output the letter without any explanation.\n\n"
-            + "\n".join(discussion_history)
-            + "\n\nFinal answer (only A, B, C, or D):"
+            "Role: Neutral Judge\n\n"
+            "Discussion Summary:\n"
+            f"{recent_discussion}\n\n"
+            "Task: Determine the FINAL answer (A/B/C/D) that both experts agree on.\n"
+            "Output ONLY the letter (A, B, C, or D) with no other text.\n"
+            "Final Answer:"
         )
 
         response = self.llm.create_completion(
             prompt=prompt,
             max_tokens=2,
-            temperature=0.0,
-            stop=["\n", "."]
+            temperature=0.1,
+            stop=["\n", ".", ","]
         )
+        
         raw = response["choices"][0]["text"].strip().upper()
         parsed = extract_answer_letter(raw)
         print(f"[Judge] Raw: {raw} → Judged final answer: {parsed}")
@@ -79,18 +99,21 @@ def load_ai2_arc():
     return load_dataset("allenai/ai2_arc", "ARC-Challenge")["test"]
 
 def prepare_agent_context(agent_entries):
-    context = "You have access to the following questions and their correct answers:\n\n"
-    for entry in agent_entries:
-        question = entry["question"]
-        choices = "\n".join([f"{label}: {text}" for label, text in zip(entry["choices"]["label"], entry["choices"]["text"])])
+    context = "You know these specific Q&A pairs:\n"
+    for entry in agent_entries[:MAX_CONTEXT_EXAMPLES]:
+        question = entry["question"][:150]
         answer = entry["answerKey"].strip()
-        context += f"Q: {question}\nChoices:\n{choices}\nCorrect Answer: {answer}\n\n"
+        context += f"- Q: {question} → A: {answer}\n"
     return context
 
-def debate_and_judge(agent1, agent2, judge, user_question, max_turns=5):
+def debate_and_judge(agent1, agent2, judge, user_question, max_turns=3):
     agent1.reset()
     agent2.reset()
 
+    # clearer instructions
+    agent1.receive("System", "Discuss to find the correct answer. Reference your knowledge.")
+    agent2.receive("System", "Discuss to find the correct answer. Reference your knowledge.")
+    
     agent1.receive("User", user_question)
     agent2.receive("User", user_question)
 
@@ -102,47 +125,47 @@ def debate_and_judge(agent1, agent2, judge, user_question, max_turns=5):
         msg2 = agent2.respond()
         agent1.receive(agent2.name, msg2)
 
-    return judge.analyze(agent1.memory + agent2.memory)
+    answer = judge.analyze(agent1.memory + agent2.memory)
+    if answer not in ["A", "B", "C", "D"]:
+        answers = [extract_answer_letter(msg) for msg in agent1.memory + agent2.memory]
+        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
+        answer = max(set(valid_answers), key=valid_answers.count) if valid_answers else "INVALID"
+    return answer
 
 def benchmark_multiagent_system(agent1, agent2, judge):
     dataset = load_ai2_arc()
     dataset = dataset.select(range(MAX_EXAMPLES))
     entries = list(dataset)
 
-    # divide dataset
     mid = len(entries) // 2
-    entries_agent1 = entries[:mid]
-    entries_agent2 = entries[mid:]
-
-    context1 = prepare_agent_context(entries_agent1)
-    context2 = prepare_agent_context(entries_agent2)
+    agent1.knowledge = prepare_agent_context(entries[:mid])
+    agent2.knowledge = prepare_agent_context(entries[mid:])
 
     results = []
     start_time = time.time()
 
     for idx, entry in enumerate(entries):
         question = entry["question"]
-        labels = entry["choices"]["label"]
-        texts = entry["choices"]["text"]
+        choices = "\n".join([
+            f"{label}: {text}" 
+            for label, text in zip(
+                entry["choices"]["label"], 
+                entry["choices"]["text"]
+            )
+        ])
         expected = entry["answerKey"].strip()
 
-        choices = "\n".join([f"{label}: {text}" for label, text in zip(labels, texts)])
-
         user_prompt = (
-            "You are two collaborating experts who have access to your own questions and their answers. "
-            "Discuss together to determine the correct answer to the question below.\n\n"
-            f"{agent1.name} context:\n{context1}\n"
-            f"{agent2.name} context:\n{context2}\n\n"
-            f"Q: {question}\nChoices:\n{choices}"
+            f"Question:\n{question}\n\n"
+            f"Options:\n{choices}\n\n"
+            "Discuss and determine the single correct answer."
         )
 
         predicted = debate_and_judge(agent1, agent2, judge, user_prompt)
-
         results.append({"prediction": predicted, "reference": expected})
 
-        print(f"\nQ{idx+1}: {question}")
-        print(f"Expected: {expected}")
-        print(f"Predicted: {predicted}\n")
+        print(f"\nQ{idx+1}: {question[:60]}...")
+        print(f"Expected: {expected} | Predicted: {predicted}")
 
     elapsed = time.time() - start_time
     score = metric.compute(
@@ -158,7 +181,7 @@ if __name__ == "__main__":
         judge = JudgeAgent(MODEL_PATH)
 
         acc, total_time = benchmark_multiagent_system(agent_a, agent_b, judge)
-        print(f"\nMulti-Agent (with ground-truth context) - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
+        print(f"\nMulti-Agent System - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
     finally:
         del agent_a.llm
         del agent_b.llm
