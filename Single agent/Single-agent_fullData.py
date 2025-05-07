@@ -20,19 +20,22 @@ os.environ["PYTHONHASHSEED"] = str(SEED)
 
 def extract_answer_letter(text):
     patterns = [
-        r"final answer:?\s*([A-D])",
+        r"correct answer is:?\s*([A-D])",  # specific pattern first
         r"answer:?\s*([A-D])",
         r"choice:?\s*([A-D])",
-        r"correct:?\s*([A-D])",
         r"option:?\s*([A-D])",
-        r"therefore.*?([A-D])",
-        r"\b([A-D])\b(?![a-z])" 
+        r"select.*?([A-D])",
+        r"conclusion.*?([A-D])",
+        r"\b([A-D])\b(?![a-z])"  # general pattern last
     ]
     
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).upper()
+    # check last few lines first where conclusion usually appears
+    lines = text.split('\n')[-5:] if '\n' in text else [text]
+    for line in reversed(lines):
+        for pattern in patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                return match.group(1).upper()
     return None
 
 def prepare_agent_context(entries):
@@ -62,7 +65,11 @@ When answering new questions:
 2. Compare with similar questions from your training data
 3. Analyze each option systematically
 4. Explain your reasoning step by step
-5. Conclude with: "Therefore, the correct answer is: A" or "Therefore, the correct answer is: B" or "Therefore, the correct answer is: C" or "Therefore, the correct answer is: D"
+5. Conclude with EXACTLY ONE of these EXACT phrases:
+   - "Therefore, the correct answer is: A"
+   - "Therefore, the correct answer is: B"
+   - "Therefore, the correct answer is: C"
+   - "Therefore, the correct answer is: D"
 
 Question:
 {context}
@@ -71,7 +78,7 @@ Your analysis:"""
         response = self.llm.create_completion(
             prompt=prompt,
             temperature=0.3,
-            max_tokens=1000, 
+            max_tokens=500, 
             stop=["\n\n", "Question:"],
             logit_bias={65: 5, 66: 5, 67: 5, 68: 5}  # biased toward A/B/C/D
         )
@@ -93,23 +100,36 @@ class Judge:
         if answer:
             print(f"[Judge] Direct extraction: {answer}")
             return answer
-            
-        judge_prompt = f"""Extract the final answer (A, B, C, or D) from this response:
+        
+        judge_prompt = f"""Extract ONLY the final answer letter (A, B, C, or D) from this response. 
+Look for the exact phrase "Therefore, the correct answer is: X" or similar conclusive statements.
+
+Response:
 {agent_output}
 
-Only respond with the single letter, nothing else. Answer:"""
+Extracted answer (ONLY the letter A, B, C, or D):"""
         
         response = self.llm.create_completion(
             prompt=judge_prompt,
             max_tokens=1,
             temperature=0.0,
-            stop=["\n", " "],
-            logit_bias={65: 10, 66: 10, 67: 10, 68: 10}  # stronger bias toward A/B/C/D
+            stop=["\n", ".", ",", " "],
+            logit_bias={65: 100, 66: 100, 67: 100, 68: 100}  # mega strong bias
         )
         
         raw = response["choices"][0]["text"].strip().upper()
-        answer = extract_answer_letter(raw) or random.choice(["A", "B", "C", "D"])
-        print(f"[Judge] LLM extraction: {answer}")
+        answer = extract_answer_letter(raw)
+        
+        if not answer:
+            last_line = agent_output.split('\n')[-1] if '\n' in agent_output else agent_output
+            answer = extract_answer_letter(last_line)
+        
+        if not answer:
+            answer = random.choice(["A", "B", "C", "D"])
+            print(f"[Judge] Warning: Could not determine answer, choosing randomly: {answer}")
+        else:
+            print(f"[Judge] LLM extraction: {answer}")
+            
         return answer
 
 def load_ai2_arc():
@@ -159,7 +179,6 @@ if __name__ == "__main__":
         acc, total_time = benchmark(agent, judge)
         print(f"\nSingle Agent System - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
     finally:
-        # avoid the TypeError on exit
         if hasattr(agent, 'llm'):
             del agent.llm
         if hasattr(judge, 'llm'):
