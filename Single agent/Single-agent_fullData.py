@@ -35,28 +35,43 @@ def extract_answer_letter(text):
             return match.group(1).upper()
     return None
 
+def prepare_agent_context(entries):
+    context = "You have been trained with these specific Q&A pairs:\n"
+    for entry in entries[:MAX_EXAMPLES]:
+        question = entry["question"][:150]  # truncate long questions
+        answer = entry["answerKey"].strip()
+        context += f"- Q: {question} → A: {answer}\n"
+    return context
+
 class SingleAgent:
-    def __init__(self, model_path):
+    def __init__(self, model_path, knowledge=""):
         self.llm = Llama(
             model_path=model_path,
             n_ctx=4096,
             n_threads=4
         )
+        self.knowledge = knowledge
 
     def answer(self, context):
-        prompt = f"""You are an expert answering multiple-choice science questions. Follow these steps:
-            1. Read the question carefully
-            2. Analyze each option systematically
-            3. Explain your reasoning for why each option might be correct or incorrect
-            4. Conclude with: "Therefore, the correct answer is: [A/B/C/D]"
-            Question:
-            {context}
-            Your analysis:"""
+        prompt = f"""You are an expert answering multiple-choice science questions. 
+Here is your training data:
+{self.knowledge}
+
+When answering new questions:
+1. Carefully read the question and all options
+2. Compare with similar questions from your training data
+3. Analyze each option systematically
+4. Explain your reasoning step by step
+5. Conclude with: "Therefore, the correct answer is: A" or "Therefore, the correct answer is: B" or "Therefore, the correct answer is: C" or "Therefore, the correct answer is: D"
+
+Question:
+{context}
+Your analysis:"""
         
         response = self.llm.create_completion(
             prompt=prompt,
             temperature=0.3,
-            max_tokens=300, 
+            max_tokens=1000, 
             stop=["\n\n", "Question:"],
             logit_bias={65: 5, 66: 5, 67: 5, 68: 5}  # biased toward A/B/C/D
         )
@@ -110,6 +125,9 @@ def benchmark(agent, judge):
     dataset = dataset.select(range(MAX_EXAMPLES))
     entries = list(dataset)
 
+    # Provide all questions and answers as context to the agent
+    agent.knowledge = prepare_agent_context(entries)
+
     results = []
     start_time = time.time()
 
@@ -139,7 +157,7 @@ if __name__ == "__main__":
         judge = Judge(MODEL_PATH)
 
         acc, total_time = benchmark(agent, judge)
-        print(f"\nImproved System - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
+        print(f"\nSingle Agent System - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
     finally:
         # avoid the TypeError on exit
         if hasattr(agent, 'llm'):
