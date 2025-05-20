@@ -9,8 +9,10 @@ import numpy as np
 
 # A single agent gets all the questions and corresponding answers before answering.
 
-MODEL_PATH = "/Users/nadaeddahir/mistral-gguf/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
-MAX_EXAMPLES = 10
+# MODEL_PATH = "/Users/nadaeddahir/mistral-gguf/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+
+MODEL_PATH = "/Users/nadaeddahir/Downloads/Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf"
+MAX_EXAMPLES = 20
 SEED = 42
 metric = evaluate.load("exact_match")
 

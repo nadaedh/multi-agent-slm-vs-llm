@@ -1,150 +1,214 @@
 import os
-import random
-import time
 import re
+import time
 from llama_cpp import Llama
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 import evaluate
-import numpy as np
-
-# Two agents each get half of the questions with corresponding answers of the dataset before discussing each question and answering. 
-# A judge reads the conversation and determines the letter corresponding to the given answer. 
-
 
 MODEL_PATH = "/Users/nadaeddahir/mistral-gguf/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
-MAX_EXAMPLES = 10  
-SEED = 42
-MAX_CONTEXT_EXAMPLES = 5
+MAX_EXAMPLES = 10
+MAX_CONTEXT_EXAMPLES = 3
 metric = evaluate.load("exact_match")
 
-random.seed(SEED)
-np.random.seed(SEED)
-os.environ["PYTHONHASHSEED"] = str(SEED)
+def extract_answer(text):
+    patterns = [
+        r"final answer:\s*([A-D])",
+        r"correct answer is:\s*([A-D])",
+        r"best option is:\s*([A-D])",
+        r"conclusion:\s*([A-D])",
+        r"\b([A-D])\b(?![a-z])"
+    ]
+    text = text.upper()
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1)
+    return None
 
-def extract_answer_letter(text):
-    match = re.search(r"\b([A-D])\b", text.upper())
-    return match.group(1) if match else "INVALID"
-
-class MistralAgent:
-    def __init__(self, name, model_path, knowledge=""):
+class SpecialistAgent:
+    def __init__(self, name, domain, model_path):
         self.name = name
+        self.domain = domain
         self.llm = Llama(
             model_path=model_path,
-            n_ctx=4096,
+            n_ctx=2048,
             n_threads=4,
-            logits_all=True
+            n_gpu_layers=1
         )
-        self.memory = []
+        self.knowledge = ""
+        self.domain_keywords = self._get_domain_keywords(domain)
+        
+    def _get_domain_keywords(self, domain):
+        """Get relevant keywords for domain detection"""
+        if "physic" in domain.lower():
+            return ["physics", "energy", "force", "matter", "atom", "quantum", "gravity"]
+        elif "bio" in domain.lower():
+            return ["biology", "life", "cell", "organism", "DNA", "evolution", "ecosystem"]
+        return []
+        
+    def set_knowledge(self, knowledge):
         self.knowledge = knowledge
+        
+    def domain_relevance(self, question):
+        """Determine how relevant this question is to the agent's domain"""
+        prompt = f"""As a {self.domain} specialist, assess the relevance of this question to your domain:
+Question: {question}
 
-    def reset(self):
-        self.memory.clear()
+Domain Keywords: {', '.join(self.domain_keywords)}
 
-    def receive(self, sender, message):
-        self.memory.append(f"{sender}: {message}")
+Provide a single score from 0-100 where:
+- 0-30: Not relevant
+- 31-70: Somewhat relevant 
+- 71-100: Highly relevant
 
-    def respond(self):
-        prompt = (
-            f"Role: You are {self.name}, an expert with specific knowledge.\n"
-            f"Knowledge:\n{self.knowledge}\n\n"
-            "Conversation History:\n" + "\n".join(self.memory) + 
-            f"\n{self.name}: Based on my knowledge and the discussion, the answer is"
-        )
-
+Relevance score:"""
+        
         response = self.llm.create_completion(
             prompt=prompt,
-            temperature=0.3,  # lower temperature for more focused answers
             max_tokens=10,
-            stop=["\n", ".", ","]
+            temperature=0.1,
+            stop=["\n"]
         )
+        try:
+            return int(response['choices'][0]['text'].strip())
+        except:
+            return 0
+        
+    def analyze_question(self, question):
+        prompt = f"""As a {self.domain} specialist with this knowledge:
+{self.knowledge}
 
-        raw_output = response["choices"][0]["text"].strip()
-        self.memory.append(f"{self.name}: {raw_output}")
-        print(f"[{self.name}] Raw: {raw_output}")
-        return raw_output
+Analyze this question thoroughly:
+{question}
 
-class JudgeAgent:
+Provide structured analysis:
+1. Domain relevance assessment
+2. Key concepts involved
+3. Potential solution approach
+4. Suggested answer (A/B/C/D) with detailed reasoning
+
+Analysis:"""
+        
+        response = self.llm.create_completion(
+            prompt=prompt,
+            max_tokens=300,
+            temperature=0.3,
+            stop=["\n\n"]
+        )
+        return response['choices'][0]['text'].strip()
+        
+    def respond_to_argument(self, opponent_argument, question):
+        prompt = f"""As a {self.domain} specialist, you're in a debate about:
+{question}
+
+Your opponent argues:
+{opponent_argument}
+
+Your knowledge:
+{self.knowledge}
+
+Provide a structured counter-argument:
+1. Points of agreement (if any)
+2. Points of disagreement with reasoning
+3. Supporting evidence from your domain
+4. Refined answer suggestion (A/B/C/D)
+
+Counter-argument:"""
+        
+        response = self.llm.create_completion(
+            prompt=prompt,
+            max_tokens=300,
+            temperature=0.3,
+            stop=["\n\n"]
+        )
+        return response['choices'][0]['text'].strip()
+
+class DebateModerator:
     def __init__(self, model_path):
         self.llm = Llama(
             model_path=model_path,
-            n_ctx=4096,
+            n_ctx=2048,
             n_threads=4
         )
-
-    def analyze(self, discussion_history):
-        recent_discussion = "\n".join(discussion_history[-6:]) # only last few turns for decision
+    
+    def conduct_debate(self, question, agent1, agent2, max_rounds=2):
+        """Facilitate a structured debate between two specialists"""
+        analysis1 = agent1.analyze_question(question)
+        analysis2 = agent2.analyze_question(question)
         
-        prompt = (
-            "Role: Neutral Judge\n\n"
-            "Discussion Summary:\n"
-            f"{recent_discussion}\n\n"
-            "Task: Determine the FINAL answer (A/B/C/D) that both experts agree on.\n"
-            "Output ONLY the letter (A, B, C, or D) with no other text.\n"
-            "Final Answer:"
-        )
+        debate_history = [
+            f"Round 0 - {agent1.name} initial analysis:\n{analysis1}",
+            f"Round 0 - {agent2.name} initial analysis:\n{analysis2}"
+        ]
+        
+        # Debate
+        for round_num in range(1, max_rounds+1):
+            # Agent1 responds to Agent2's last message
+            response1 = agent1.respond_to_argument(analysis2, question)
+            debate_history.append(f"Round {round_num} - {agent1.name} response:\n{response1}")
+            
+            # Agent2 responds to Agent1's last message
+            response2 = agent2.respond_to_argument(response1, question)
+            debate_history.append(f"Round {round_num} - {agent2.name} response:\n{response2}")
+            
+            analysis1, analysis2 = response1, response2
+        
+        relevance1 = agent1.domain_relevance(question)
+        relevance2 = agent2.domain_relevance(question)
+        
+        if relevance1 > relevance2 + 20:  
+            final_answer = extract_answer(analysis1)
+        elif relevance2 > relevance1 + 20:
+            final_answer = extract_answer(analysis2)
+        else: 
+            final_answer = self.determine_answer(question, analysis1, analysis2)
+            
+        return final_answer or "INVALID", "\n\n".join(debate_history)
+    
+    def determine_answer(self, question, analysis1, analysis2):
+        prompt = f"""After a detailed debate, determine the most correct answer for:
+{question}
 
+Debate Summary:
+- Expert 1 Analysis: {analysis1[:500]}...
+- Expert 2 Analysis: {analysis2[:500]}...
+
+As the moderator, evaluate:
+1. Logical consistency of each argument
+2. Strength of evidence provided
+3. Domain expertise relevance
+
+Final reasoned answer (A/B/C/D):"""
+        
         response = self.llm.create_completion(
             prompt=prompt,
-            max_tokens=2,
+            max_tokens=100,
             temperature=0.1,
-            stop=["\n", ".", ","]
+            stop=["\n"]
         )
-        
-        raw = response["choices"][0]["text"].strip().upper()
-        parsed = extract_answer_letter(raw)
-        print(f"[Judge] Raw: {raw} → Judged final answer: {parsed}")
-        return parsed
+        return extract_answer(response['choices'][0]['text'])
 
-def load_ai2_arc():
-    return load_dataset("allenai/ai2_arc", "ARC-Challenge")["test"]
+def prepare_knowledge(entries):
+    """Create more focused knowledge snippets"""
+    return "\n".join(
+        f"Example {i+1}: Q: {e['question'][:80]}... | Correct Answer: {e['answerKey']} | Key Concepts: {', '.join(e['choices']['text'][:3])}"
+        for i, e in enumerate(entries.select(range(MAX_CONTEXT_EXAMPLES))))
 
-def prepare_agent_context(agent_entries):
-    context = "You know these specific Q&A pairs:\n"
-    for entry in agent_entries[:MAX_CONTEXT_EXAMPLES]:
-        question = entry["question"][:150]
-        answer = entry["answerKey"].strip()
-        context += f"- Q: {question} → A: {answer}\n"
-    return context
-
-def debate_and_judge(agent1, agent2, judge, user_question, max_turns=3):
-    agent1.reset()
-    agent2.reset()
-
-    # clearer instructions
-    agent1.receive("System", "Discuss to find the correct answer. Reference your knowledge.")
-    agent2.receive("System", "Discuss to find the correct answer. Reference your knowledge.")
-    
-    agent1.receive("User", user_question)
-    agent2.receive("User", user_question)
-
-    for turn in range(max_turns):
-        print(f"\nTurn {turn+1}:")
-        msg1 = agent1.respond()
-        agent2.receive(agent1.name, msg1)
-
-        msg2 = agent2.respond()
-        agent1.receive(agent2.name, msg2)
-
-    answer = judge.analyze(agent1.memory + agent2.memory)
-    if answer not in ["A", "B", "C", "D"]:
-        answers = [extract_answer_letter(msg) for msg in agent1.memory + agent2.memory]
-        valid_answers = [a for a in answers if a in ["A", "B", "C", "D"]]
-        answer = max(set(valid_answers), key=valid_answers.count) if valid_answers else "INVALID"
-    return answer
-
-def benchmark_multiagent_system(agent1, agent2, judge):
-    dataset = load_ai2_arc()
+def benchmark_specialized_agents(physicist, biologist, moderator):
+    dataset = load_dataset("allenai/ai2_arc", "ARC-Challenge")["test"]
     dataset = dataset.select(range(MAX_EXAMPLES))
-    entries = list(dataset)
-
-    mid = len(entries) // 2
-    agent1.knowledge = prepare_agent_context(entries[:mid])
-    agent2.knowledge = prepare_agent_context(entries[mid:])
-
+    
+    shared_examples = dataset.select(range(1)) 
+    physicist_entries = concatenate_datasets([dataset.select(range(MAX_CONTEXT_EXAMPLES)), shared_examples])
+    biologist_entries = concatenate_datasets([dataset.select(range(1, MAX_CONTEXT_EXAMPLES+1)), shared_examples])
+    
+    physicist.set_knowledge(prepare_knowledge(physicist_entries))
+    biologist.set_knowledge(prepare_knowledge(biologist_entries))
+    
     results = []
     start_time = time.time()
-
-    for idx, entry in enumerate(entries):
+    
+    for idx, entry in enumerate(dataset):
         question = entry["question"]
         choices = "\n".join([
             f"{label}: {text}" 
@@ -153,36 +217,54 @@ def benchmark_multiagent_system(agent1, agent2, judge):
                 entry["choices"]["text"]
             )
         ])
-        expected = entry["answerKey"].strip()
-
-        user_prompt = (
-            f"Question:\n{question}\n\n"
-            f"Options:\n{choices}\n\n"
-            "Discuss and determine the single correct answer."
+        expected = entry["answerKey"]
+        
+        full_question = f"Question:\n{question}\nOptions:\n{choices}"
+        
+        question_start = time.time()
+        predicted, debate_log = moderator.conduct_debate(
+            full_question, physicist, biologist
         )
-
-        predicted = debate_and_judge(agent1, agent2, judge, user_prompt)
-        results.append({"prediction": predicted, "reference": expected})
-
-        print(f"\nQ{idx+1}: {question[:60]}...")
-        print(f"Expected: {expected} | Predicted: {predicted}")
-
-    elapsed = time.time() - start_time
-    score = metric.compute(
-        predictions=[r["prediction"] for r in results],
-        references=[r["reference"] for r in results],
-    )
-    return score["exact_match"], elapsed
+        question_time = time.time() - question_start
+        
+        results.append({
+            "question": question[:50] + "...",
+            "expected": expected,
+            "predicted": predicted,
+            "time": question_time,
+            "debate": debate_log
+        })
+        
+        print(f"Q{idx+1}: {predicted} (Expected: {expected}) | Time: {question_time:.2f}s")
+    
+    total_time = time.time() - start_time
+    return results, total_time
 
 if __name__ == "__main__":
     try:
-        agent_a = MistralAgent("AgentA", MODEL_PATH)
-        agent_b = MistralAgent("AgentB", MODEL_PATH)
-        judge = JudgeAgent(MODEL_PATH)
-
-        acc, total_time = benchmark_multiagent_system(agent_a, agent_b, judge)
-        print(f"\nMulti-Agent System - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
+        physicist = SpecialistAgent("Dr. Quantum", "Physics and Physical Sciences", MODEL_PATH)
+        biologist = SpecialistAgent("Dr. Bio", "Biology and Life Sciences", MODEL_PATH)
+        moderator = DebateModerator(MODEL_PATH)
+        
+        results, total_time = benchmark_specialized_agents(physicist, biologist, moderator)
+        
+        accuracy = metric.compute(
+            predictions=[r["predicted"] for r in results],
+            references=[r["expected"] for r in results]
+        )["exact_match"]
+        
+        print(f"\nSpecialized Multi-Agent System - Accuracy: {accuracy*100:.2f}% | Time: {total_time:.2f}s")
+        
+        with open("debate_logs.txt", "w") as f:
+            for i, result in enumerate(results):
+                f.write(f"\n\nQuestion {i+1}: {result['question']}")
+                f.write(f"\nExpected: {result['expected']} | Predicted: {result['predicted']}")
+                f.write(f"\nDebate Log:\n{result['debate']}")
+    
     finally:
-        del agent_a.llm
-        del agent_b.llm
-        del judge.llm
+        if 'physicist' in locals():
+            del physicist.llm
+        if 'biologist' in locals():
+            del biologist.llm
+        if 'moderator' in locals():
+            del moderator.llm
