@@ -8,8 +8,8 @@ import evaluate
 
 # 2 agents and decides final answer based on confidence level of each model (they do not interact)
 
-MODEL_PATH = "/Users/nadaeddahir/mistral-gguf/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
-MAX_EXAMPLES = 10
+MODEL_PATH = "/localhome/eddahir/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+MAX_EXAMPLES = 50
 metric = evaluate.load("exact_match")
 
 def extract_answer_letter(text):
@@ -112,12 +112,6 @@ def benchmark_agents(agent1, agent2=None):
     return score["exact_match"], elapsed
 
 if __name__ == "__main__":
-    try:
-        solo = MistralAgent("SoloMistral", MODEL_PATH)
-        acc_solo, time_solo = benchmark_agents(solo)
-        print(f"\nSolo Agent - Accuracy: {acc_solo*100:.2f}% | Time: {time_solo:.2f}s")
-    finally:
-        del solo.llm
 
     try:
         agent_a = MistralAgent("AgentA", MODEL_PATH)

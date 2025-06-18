@@ -8,8 +8,8 @@ import evaluate
 # 2 agents each respond to the same question with their answer, they inform each other of their choices up to max_turns (3).
 # If both agents agree on a valid letter, it’s returned, otherwise, it picks the final answer using confidence-weighted voting.
 
-MODEL_PATH = "/Users/nadaeddahir/mistral-gguf/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
-MAX_EXAMPLES = 5
+MODEL_PATH = "/localhome/eddahir/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+MAX_EXAMPLES = 50
 metric = evaluate.load("exact_match")
 
 def extract_answer_letter(text):
@@ -30,34 +30,29 @@ class MistralAgent:
         self.memory.clear()
 
     def receive(self, sender, message):
-        self.memory.append(f"{sender}: {message}")
+        full_msg = f"{sender}: {message}"
+        self.memory.append(full_msg)
 
     def respond(self):
         prompt = "\n".join(self.memory) + f"\n{self.name}:"
 
         response = self.llm.create_completion(
             prompt=prompt,
-            #max_tokens=30,
             temperature=0.0,
-            stop=["\n", "."],
+            max_tokens= 100,
             logprobs=5
         )
-
-        # full_text = response["choices"][0]["text"].strip()
-        # print(f"[{self.name}] Full model response:\n{full_text}\n")
 
         raw_output = response["choices"][0]["text"].strip().upper()
         parsed = extract_answer_letter(raw_output)
 
         logprobs = response["choices"][0]["logprobs"]["token_logprobs"]
-        if logprobs and logprobs[0] is not None:
-            prob = math.exp(logprobs[0])
-        else:
-            prob = 0.0
+        prob = math.exp(logprobs[0]) if logprobs and logprobs[0] is not None else 0.0
 
-        print(f"[{self.name}] Raw: {raw_output} → Parsed: {parsed} (conf: {prob:.4f})")
-        # self.memory.append(f"{self.name}: {parsed}")
-        self.memory.append(f"{self.name}: {raw_output}")
+        full_msg = f"{self.name}: {raw_output}"
+        print(f"[{self.name}] Responded → {full_msg} (Parsed: {parsed}, Conf: {prob:.4f})")
+
+        self.memory.append(full_msg)
         return parsed, prob, raw_output
 
 def debate_until_agreement(agent1, agent2, user_prompt, max_turns=5):
@@ -67,9 +62,15 @@ def debate_until_agreement(agent1, agent2, user_prompt, max_turns=5):
     agent2.receive("User", user_prompt)
 
     REMINDER = (
-        "Reminder: You must respond in this exact format:\n"
-        "'My answer is: <LETTER>. Here's why: <your reasoning>'\n"
-        "Only one letter (A, B, C, or D)."
+        """When answering questions:
+1. Carefully read the question and all options
+2. Analyze each option systematically
+3. Explain your reasoning
+4. Conclude with EXACTLY ONE of these EXACT phrases:
+   - "My answer is: A"
+   - "My answer is: B"
+   - "My answer is: C"
+   - "My answer is: D" """
     )
 
 

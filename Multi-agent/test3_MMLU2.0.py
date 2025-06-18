@@ -3,16 +3,15 @@ import os
 import random
 import time
 import re
+import numpy as np
 from llama_cpp import Llama
 from datasets import load_dataset
 import evaluate
-import numpy as np
 
-# 2 agents each respond to the same question with their answer, they inform each other of their choices up to max_turns (5).
-# Then a 3rd agent acting as the judge reads the final answer and tells us what letter it corresponds to.
+# Debate + judge using MMLU (anatomy), A gets all answers, B gets none
 
-MODEL_PATH = "/Users/nadaeddahir/mistral-gguf/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
-MAX_EXAMPLES = 10
+MODEL_PATH = "/localhome/eddahir/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+MAX_EXAMPLES = 50
 metric = evaluate.load("exact_match")
 
 # Fix seeds
@@ -25,9 +24,18 @@ def extract_answer_letter(text):
     match = re.search(r"\b([A-D])\b", text.upper())
     return match.group(1) if match else "INVALID"
 
+def prepare_agent_context(entries):
+    context = "You have been trained with the following Q&A examples:\n"
+    for entry in entries:
+        q = entry["question"][:150]
+        a = chr(65 + entry["answer"])  # Convert index to A-D
+        context += f"- Q: {q} → A: {a}\n"
+    return context
+
 class MistralAgent:
-    def __init__(self, name, model_path):
+    def __init__(self, name, model_path, knowledge=""):
         self.name = name
+        self.knowledge = knowledge
         self.llm = Llama(model_path=model_path, n_ctx=2048, logits_all=True)
         self.memory = []
 
@@ -38,7 +46,11 @@ class MistralAgent:
         self.memory.append(f"{sender}: {message}")
 
     def respond(self):
-        prompt = "\n".join(self.memory) + f"\n{self.name}:"
+        prompt = ""
+        if self.knowledge:
+            prompt += f"You are a helpful medical expert. Use the following Q&A examples to guide your reasoning:\n{self.knowledge}\n\n"
+
+        prompt += "\n".join(self.memory) + f"\n{self.name}:"
 
         response = self.llm.create_completion(
             prompt=prompt,
@@ -98,26 +110,27 @@ def debate_and_judge(agent1, agent2, judge, user_prompt, max_turns=5):
 
     return judge.analyze(agent1.memory + agent2.memory)
 
-def load_ai2_arc():
-    return load_dataset("allenai/ai2_arc", "ARC-Challenge")["test"]
+def load_mmlu_anatomy():
+    return load_dataset("cais/mmlu", "anatomy")["test"].select(range(MAX_EXAMPLES))
 
 def benchmark_debate_system(agent1, agent2, judge):
-    dataset = load_ai2_arc()
+    dataset = load_mmlu_anatomy()
+    entries = list(dataset)
+    agent1.knowledge = prepare_agent_context(entries)  # give A all answers
+
     results = []
     start_time = time.time()
 
-    for i in range(MAX_EXAMPLES):
-        entry = dataset[i]
+    for i, entry in enumerate(entries):
         question = entry["question"]
-        labels = entry["choices"]["label"]
-        texts = entry["choices"]["text"]
-        expected = entry["answerKey"].strip()
+        choices = entry["choices"]
+        expected = chr(65 + entry["answer"])
 
-        choices = "\n".join([f"{label}: {text}" for label, text in zip(labels, texts)])
+        labeled_choices = "\n".join([f"{chr(65 + j)}: {text}" for j, text in enumerate(choices)])
         formatted = (
-            "You are a helpful science expert. Your task is to answer the multiple-choice science question below. "
-            "You must discuss your reasoning with a fellow expert.\n\n"
-            f"Q: {question}\nChoices:\n{choices}"
+            "You are a helpful medical expert. Your task is to answer the multiple-choice anatomy question below. "
+            "You must discuss your reasoning with a fellow expert before agreeing on the correct choice.\n\n"
+            f"Q: {question}\nChoices:\n{labeled_choices}"
         )
 
         answer = debate_and_judge(agent1, agent2, judge, formatted)
@@ -137,11 +150,11 @@ def benchmark_debate_system(agent1, agent2, judge):
 if __name__ == "__main__":
     try:
         agent_a = MistralAgent("AgentA", MODEL_PATH)
-        agent_b = MistralAgent("AgentB", MODEL_PATH)
+        agent_b = MistralAgent("AgentB", MODEL_PATH)  # gets no context
         judge = JudgeAgent(MODEL_PATH)
 
         acc, total_time = benchmark_debate_system(agent_a, agent_b, judge)
-        print(f"\nMulti-Agent w/ Judge - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
+        print(f"\nMulti-Agent Debate w/ Judge (MMLU-Anatomy, A has context) - Accuracy: {acc*100:.2f}% | Time: {total_time:.2f}s")
     finally:
         del agent_a.llm
         del agent_b.llm
